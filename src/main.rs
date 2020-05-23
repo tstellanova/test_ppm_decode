@@ -19,13 +19,17 @@ use pac::interrupt;
 use cortex_m_rt as rt;
 use rt::entry;
 
+use ppm_decode::{PpmParser};
 use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
-use lazy_static::{lazy_static};
+use core::ops::DerefMut;
 
-lazy_static! {
-    static ref MUTEX_EXTI:  Mutex<RefCell<Option<pac::EXTI>>>  = Mutex::new(RefCell::new(None));
-}
+
+//static USER_LED_1:  Mutex<RefCell<Option< GpioTypeUserLed1>>> = Mutex::new(RefCell::new(None));
+/// Stores the EXTI interrupt configuration
+static MUTEX_EXTI:  Mutex<RefCell<Option<pac::EXTI>>>  = Mutex::new(RefCell::new(None));
+/// Stores the PPM decoder touched by interrupt handlers and main loop
+static PPM_DECODER: Mutex<RefCell<Option<PpmParser>>>  = Mutex::new(RefCell::new(None));
 
 
 /// Initialize peripherals for Pixracer.
@@ -85,6 +89,14 @@ pub fn setup_peripherals()  -> (
     });
 
 
+    // cortex_m::interrupt::free(|cs| {
+    //     if let Some(ref mut exti) = MUTEX_EXTI.borrow(cs).borrow_mut().deref_mut() {
+    //         exti.as_ref().unwrap()
+    //             .pr.modify(|_, w| w.pr0().set_bit());
+    //     }
+    // });
+
+
     // enable EXTI0 interrrupt in NVIC
     unsafe { pac::NVIC::unmask(pac::interrupt::EXTI0); }
 
@@ -97,12 +109,19 @@ pub fn setup_peripherals()  -> (
 
 #[interrupt]
 fn EXTI0() {
+
     cortex_m::interrupt::free(|cs| {
-        // clear the interrupt pending bit on EXTI line 0
-        let exti = MUTEX_EXTI.borrow(cs).borrow();
-        exti.as_ref().unwrap()
-            .pr.modify(|_, w| w.pr0().set_bit());
+        // clear the interrupt
+        if let Some(ref mut exti) = MUTEX_EXTI.borrow(cs).borrow_mut().deref_mut() {
+            exti.pr.modify(|_, w| w.pr0().set_bit());
+        }
+        // tell the PPM parser we got a pulse start
+        if let Some(ref mut parser) = PPM_DECODER.borrow(cs).borrow_mut().deref_mut() {
+           parser.handle_pulse_start(0);
+        }
     });
+
+
 }
 
 
@@ -115,14 +134,22 @@ fn main() -> ! {
     rtt_init_print!(NoBlockTrim);
     rprintln!("-- > MAIN --");
 
-    let     (
-        (mut user_led1, mut user_led2, mut user_led3),
+    //create and stash the ppm decoder
+    let parser = ppm_decode::PpmParser::new();
+    cortex_m::interrupt::free(|cs| {
+        PPM_DECODER.borrow(cs).replace(Some(parser))
+    });
+
+    let (
+        (mut user_led1,
+            mut user_led2,
+            mut user_led3),
         mut delay_source,
         _ppm_in
     ) = setup_peripherals();
 
-    let _ = user_led1.set_high();
-    let _ = user_led2.set_low();
+    let _ = user_led1.set_low();
+    let _ = user_led2.set_high();
     let _ = user_led3.set_high();
 
 
@@ -130,5 +157,27 @@ fn main() -> ! {
         // all the interesting stuff happens in interrupt handlers
         delay_source.delay_ms(250u8);
         let _ = user_led1.toggle();
+
+        if let Some(frame) =
+            cortex_m::interrupt::free(|cs| {
+                if let Some(ref mut parser) =
+                PPM_DECODER.borrow(cs).borrow_mut().deref_mut() {
+                    parser.next_frame()
+                } else {
+                    None
+                }
+            })
+        {
+            // valid PPM frame parsed
+            let _ = user_led2.set_low();
+            let _ = user_led1.set_high();
+
+
+            rprintln!("chans {}: {:?}", frame.chan_count, frame.chan_values);
+        }
+        else {
+            // no available PPM frame
+            let _ = user_led2.set_high();
+        }
     }
 }
