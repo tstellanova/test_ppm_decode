@@ -32,6 +32,9 @@ static MUTEX_EXTI:  Mutex<RefCell<Option<pac::EXTI>>>  = Mutex::new(RefCell::new
 static PPM_DECODER: Mutex<RefCell<Option<PpmParser>>>  = Mutex::new(RefCell::new(None));
 
 
+/// Verify: clock ticks per microsecond
+const TICKS_PER_MICRO: u32 =   (168/8);
+
 /// Initialize peripherals for Pixracer.
 /// Pixracer chip is [STM32F427VIT6 rev.3](http://www.st.com/web/en/catalog/mmc/FM141/SC1169/SS1577/LN1789)
 pub fn setup_peripherals()  -> (
@@ -115,18 +118,20 @@ fn EXTI0() {
         if let Some(ref mut exti) = MUTEX_EXTI.borrow(cs).borrow_mut().deref_mut() {
             exti.pr.modify(|_, w| w.pr0().set_bit());
         }
-        // tell the PPM parser we got a pulse start
-        if let Some(ref mut parser) = PPM_DECODER.borrow(cs).borrow_mut().deref_mut() {
-           parser.handle_pulse_start(0);
+        // get current time
+        // TODO get clock time in a safer way? this is atomic with no side effects
+        let cur_sys_ticks = unsafe { (*pac::SYST::ptr()).cvr.read() };
+        // scale ticks to micros before providing to PPM decoder
+        let micros = cur_sys_ticks / TICKS_PER_MICRO;
+        // tell the PPM decoder we got a pulse start
+        if let Some(ref mut decoder) = PPM_DECODER.borrow(cs).borrow_mut().deref_mut() {
+            decoder.handle_pulse_start(micros);
         }
     });
 
-
 }
 
-
-
-pub type PpmInputPin = p_hal::gpio::gpiob::PB0<p_hal::gpio::Input<stm32f4xx_hal::gpio::PullUp>>;
+type PpmInputPin = p_hal::gpio::gpiob::PB0<p_hal::gpio::Input<stm32f4xx_hal::gpio::PullUp>>;
 
 
 #[entry]
