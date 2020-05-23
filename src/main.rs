@@ -10,7 +10,7 @@ use embedded_hal::digital::v2::{OutputPin, ToggleableOutputPin};
 use stm32f4xx_hal as p_hal;
 use p_hal::stm32 as pac;
 
-use p_hal::gpio::GpioExt;
+use p_hal::gpio::{GpioExt, ExtiPin};
 use p_hal::rcc::RccExt;
 use p_hal::time::{U32Ext};
 
@@ -23,11 +23,17 @@ use ppm_decode::{PpmParser};
 use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
 use core::ops::DerefMut;
+use stm32f4xx_hal::gpio::{Input, PullUp, Edge};
 
+type PpmInputPin = p_hal::gpio::gpiob::PB0<p_hal::gpio::Input<stm32f4xx_hal::gpio::PullUp>>;
 
 //static USER_LED_1:  Mutex<RefCell<Option< GpioTypeUserLed1>>> = Mutex::new(RefCell::new(None));
-/// Stores the EXTI interrupt configuration
-static MUTEX_EXTI:  Mutex<RefCell<Option<pac::EXTI>>>  = Mutex::new(RefCell::new(None));
+// Stores the EXTI interrupt configuration
+// static MUTEX_EXTI:  Mutex<RefCell<Option<pac::EXTI>>>  = Mutex::new(RefCell::new(None));
+
+/// Stores the shared input pin
+static PPM_INPUT_PIN: Mutex<RefCell<Option< PpmInputPin >>> = Mutex::new(RefCell::new(None));
+
 /// Stores the PPM decoder touched by interrupt handlers and main loop
 static PPM_DECODER: Mutex<RefCell<Option<PpmParser>>>  = Mutex::new(RefCell::new(None));
 
@@ -44,10 +50,9 @@ pub fn setup_peripherals()  -> (
         impl OutputPin + ToggleableOutputPin,
     ),
     impl DelayMs<u8>,
-    PpmInputPin,
 )
 {
-    let dp = pac::Peripherals::take().unwrap();
+    let mut dp = pac::Peripherals::take().unwrap();
     let cp = cortex_m::Peripherals::take().unwrap();
 
     // Set up the system clock
@@ -76,62 +81,52 @@ pub fn setup_peripherals()  -> (
     // use TIM3 for HRT_TIMER
     // use cap/comp channel 3 on TIM3 for PPM
     // PPM in pin is gpiob.pb0  af2
-    let ppm_in = gpiob.pb0.into_alternate_af2().into_pull_up_input();
+    let mut ppm_in = gpiob.pb0.into_alternate_af2().into_pull_up_input();
+    ppm_in.make_interrupt_source(&mut dp.SYSCFG);
+    ppm_in.enable_interrupt(&mut dp.EXTI);
+    ppm_in.trigger_on_edge(&mut dp.EXTI, Edge::FALLING);
 
-    let exti = dp.EXTI;
-
-    // attach EXTI0 to PB0 pin (where PPM input is connected)
-    dp.SYSCFG.exticr1.modify(|_, w| unsafe { w.exti0().bits(0b0001) });
-    // unmask EXTI0 interrupt
-    exti.imr.modify(|_, w| w.mr0().set_bit());
-    //set  EXTI0 to trigger on the rising edge of the PPM input
-    exti.rtsr.modify(|_, w| w.tr0().set_bit());
-    //save exti into a mutex
     cortex_m::interrupt::free(|cs| {
-        MUTEX_EXTI.borrow(cs).replace(Some(exti))
+        PPM_INPUT_PIN.borrow(cs).replace(Some(ppm_in));
     });
 
-
-    // cortex_m::interrupt::free(|cs| {
-    //     if let Some(ref mut exti) = MUTEX_EXTI.borrow(cs).borrow_mut().deref_mut() {
-    //         exti.as_ref().unwrap()
-    //             .pr.modify(|_, w| w.pr0().set_bit());
-    //     }
-    // });
-
-
-    // enable EXTI0 interrrupt in NVIC
-    unsafe { pac::NVIC::unmask(pac::interrupt::EXTI0); }
+    // Enable EXTI0 interrupt in NVIC
+    pac::NVIC::unpend(pac::Interrupt::EXTI0);
+    unsafe { pac::NVIC::unmask(pac::Interrupt::EXTI0); };
 
     (
         (user_led1, user_led2, user_led3),
         delay_source,
-        ppm_in
     )
 }
 
 #[interrupt]
 fn EXTI0() {
+    rprintln!("fire!");
+    let microtime =
+        cortex_m::interrupt::free(|cs| {
+            // clear the interrupt
+            if let Some(ref mut pin) =  PPM_INPUT_PIN.borrow(cs).borrow_mut().deref_mut() {
+                pin.clear_interrupt_pending_bit();
+            }
+            // if let Some(ref mut exti) = MUTEX_EXTI.borrow(cs).borrow_mut().deref_mut() {
+            //     exti.pr.modify(|_, w| w.pr0().set_bit());
+            // }
+            // get current time
+            // TODO get clock time in a safer way? this is atomic with no side effects
+            let cur_sys_ticks = unsafe { (*pac::SYST::ptr()).cvr.read() };
+            // scale ticks to micros before providing to PPM decoder
+            let micros = cur_sys_ticks / TICKS_PER_MICRO;
+            // tell the PPM decoder we got a pulse start
+            if let Some(ref mut decoder) = PPM_DECODER.borrow(cs).borrow_mut().deref_mut() {
+                decoder.handle_pulse_start(micros);
+            }
+            micros
+        });
 
-    cortex_m::interrupt::free(|cs| {
-        // clear the interrupt
-        if let Some(ref mut exti) = MUTEX_EXTI.borrow(cs).borrow_mut().deref_mut() {
-            exti.pr.modify(|_, w| w.pr0().set_bit());
-        }
-        // get current time
-        // TODO get clock time in a safer way? this is atomic with no side effects
-        let cur_sys_ticks = unsafe { (*pac::SYST::ptr()).cvr.read() };
-        // scale ticks to micros before providing to PPM decoder
-        let micros = cur_sys_ticks / TICKS_PER_MICRO;
-        // tell the PPM decoder we got a pulse start
-        if let Some(ref mut decoder) = PPM_DECODER.borrow(cs).borrow_mut().deref_mut() {
-            decoder.handle_pulse_start(micros);
-        }
-    });
-
+    rprintln!("micros: {}", microtime);
 }
 
-type PpmInputPin = p_hal::gpio::gpiob::PB0<p_hal::gpio::Input<stm32f4xx_hal::gpio::PullUp>>;
 
 
 #[entry]
@@ -150,7 +145,6 @@ fn main() -> ! {
             mut user_led2,
             mut user_led3),
         mut delay_source,
-        _ppm_in
     ) = setup_peripherals();
 
     let _ = user_led1.set_low();
@@ -160,7 +154,6 @@ fn main() -> ! {
 
     loop {
         // all the interesting stuff happens in interrupt handlers
-        delay_source.delay_ms(250u8);
         let _ = user_led1.toggle();
 
         if let Some(frame) =
@@ -175,14 +168,14 @@ fn main() -> ! {
         {
             // valid PPM frame parsed
             let _ = user_led2.set_low();
-            let _ = user_led1.set_high();
-
-
-            rprintln!("chans {}: {:?}", frame.chan_count, frame.chan_values);
+            // let subset = frame.chan_values[..frame.chan_count]
+            rprintln!("chans {}: {:?}", frame.chan_count, &frame.chan_values[..frame.chan_count as usize]);
         }
         else {
             // no available PPM frame
             let _ = user_led2.set_high();
+            delay_source.delay_ms(10u8);
+
         }
     }
 }
