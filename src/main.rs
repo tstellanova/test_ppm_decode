@@ -54,6 +54,8 @@ pub fn setup_peripherals()  -> (
 {
     let mut dp = pac::Peripherals::take().unwrap();
     let cp = cortex_m::Peripherals::take().unwrap();
+    //TODO verify: need to enable syscfg
+    dp.RCC.apb2enr.write(|w| w.syscfgen().enabled());
 
     // Set up the system clock
     let rcc = dp.RCC.constrain();
@@ -67,11 +69,7 @@ pub fn setup_peripherals()  -> (
 
     let delay_source = p_hal::delay::Delay::new(cp.SYST, clocks);
 
-    // let gpioa = dp.GPIOA.split();
     let gpiob = dp.GPIOB.split();
-    // let gpioc = dp.GPIOC.split();
-    // let gpiod = dp.GPIOD.split();
-    // let gpioe = dp.GPIOE.split();
 
     let user_led1 = gpiob.pb11.into_push_pull_output(); //red
     let user_led2 = gpiob.pb1.into_push_pull_output(); //green
@@ -81,7 +79,8 @@ pub fn setup_peripherals()  -> (
     // use TIM3 for HRT_TIMER
     // use cap/comp channel 3 on TIM3 for PPM
     // PPM in pin is gpiob.pb0  af2
-    let mut ppm_in = gpiob.pb0.into_alternate_af2().into_pull_up_input();
+    //TODO verify: no need to switch to AF2 ? into_alternate_af2().
+    let mut ppm_in = gpiob.pb0.into_pull_up_input();
     ppm_in.make_interrupt_source(&mut dp.SYSCFG);
     ppm_in.enable_interrupt(&mut dp.EXTI);
     ppm_in.trigger_on_edge(&mut dp.EXTI, Edge::FALLING);
@@ -102,16 +101,13 @@ pub fn setup_peripherals()  -> (
 
 #[interrupt]
 fn EXTI0() {
-    rprintln!("fire!");
     let microtime =
         cortex_m::interrupt::free(|cs| {
             // clear the interrupt
             if let Some(ref mut pin) =  PPM_INPUT_PIN.borrow(cs).borrow_mut().deref_mut() {
                 pin.clear_interrupt_pending_bit();
             }
-            // if let Some(ref mut exti) = MUTEX_EXTI.borrow(cs).borrow_mut().deref_mut() {
-            //     exti.pr.modify(|_, w| w.pr0().set_bit());
-            // }
+
             // get current time
             // TODO get clock time in a safer way? this is atomic with no side effects
             let cur_sys_ticks = unsafe { (*pac::SYST::ptr()).cvr.read() };
