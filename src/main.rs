@@ -131,9 +131,10 @@ fn EXTI0() {
             // let micros = cur_cycles/CYCLES_PER_MICRO;
 
             // // TODO get clock time in a safer way? this is atomic with no side effects
-            let cur_sys_ticks = unsafe { (*pac::SYST::ptr()).cvr.read() };
+            let cur_sys_ticks = cortex_m::peripheral::SYST::get_current();
             let monotonic_ticks = u32::max_value() - cur_sys_ticks;
-            let micros = monotonic_ticks / TICKS_PER_MICRO;
+            let ticks_per_10ms = cortex_m::peripheral::SYST::get_ticks_per_10ms();
+            let micros = (monotonic_ticks / ticks_per_10ms) * 10000;
 
             rprintln!("ticks: {} micros: {}", monotonic_ticks, micros);
 
