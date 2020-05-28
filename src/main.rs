@@ -1,61 +1,69 @@
+/*
+Copyright (c) 2020 Todd Stellanova
+LICENSE: BSD3 (see LICENSE file)
+*/
 #![no_main]
 #![no_std]
 
+//!
+//! Measures incoming CPPM pulses on the
+//! Pixracer (R12 version) board, using the port marked "RCIN"
+//! This is intended as an example of using the ppm_decode library
+//! with a real RC receiver (FrSky X4R) and microcontroller (stm32f4)
+//!
+//!
 
 use panic_rtt_core::{self, rprintln, rtt_init_print};
 
 use embedded_hal::blocking::delay::DelayMs;
 use embedded_hal::digital::v2::{OutputPin, ToggleableOutputPin};
-use embedded_hal::timer::CountDown;
-
-use stm32f4xx_hal as p_hal;
 use p_hal::stm32 as pac;
+use stm32f4xx_hal as p_hal;
 
-use p_hal::gpio::{GpioExt, ExtiPin};
+use p_hal::gpio::{Edge, ExtiPin, GpioExt};
 use p_hal::rcc::RccExt;
-use p_hal::time::{U32Ext};
-use p_hal::dwt::{ClockDuration, DwtExt};
-use cortex_m::peripheral::DWT;
-
-use p_hal::timer::Timer;
+use p_hal::time::U32Ext;
 
 use pac::interrupt;
 
 use cortex_m_rt as rt;
 use rt::entry;
 
-use ppm_decode::{PpmParser};
 use core::cell::RefCell;
-use cortex_m::interrupt::Mutex;
 use core::ops::DerefMut;
-use p_hal::gpio::{Input, PullUp, Edge};
+use cortex_m::interrupt::Mutex;
+use ppm_decode::PpmParser;
 
-type PpmInputPin = p_hal::gpio::gpiob::PB0<p_hal::gpio::Input<stm32f4xx_hal::gpio::PullUp>>;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// Stores the shared input pin
-static PPM_INPUT_PIN: Mutex<RefCell<Option< PpmInputPin >>> = Mutex::new(RefCell::new(None));
+type HighResTick = u32;
+/// enough ticks to account for at least one full PPM frame
+const MAX_PPM_TICK: HighResTick = 0xFFFF;
 
-/// Stores the PPM decoder touched by interrupt handlers and main loop
-static PPM_DECODER: Mutex<RefCell<Option<PpmParser>>>  = Mutex::new(RefCell::new(None));
+/// The GPIO input pin we use to read the CPPM input signal
+type PpmInputPin = p_hal::gpio::gpiob::PB0<p_hal::gpio::Input<p_hal::gpio::PullUp>>;
 
-/// Verify: clock ticks per microsecond
-const TICKS_PER_MICRO: u32 =   2; //(168/8);
-const CYCLES_PER_MICRO: u32 =   12;
+/// Stores the shared input pin touched by interrupt handler
+static PPM_INPUT_PIN: Mutex<RefCell<Option<PpmInputPin>>> = Mutex::new(RefCell::new(None));
 
-/// Initialize peripherals for Pixracer. Pixracer chip is:
+/// Stores the PPM decoder touched by interrupt handler and main loop
+static PPM_DECODER: Mutex<RefCell<Option<PpmParser>>> = Mutex::new(RefCell::new(None));
+
+/// For debugging/tracing output: stores the timer tick of the most recent PPM pulse edge
+static LAST_RAW_TICK: AtomicUsize = AtomicUsize::new(0);
+
+/// Initialize peripherals for Pixracer board. Pixracer chip is:
 /// [STM32F427VIT6 rev.3](http://www.st.com/web/en/catalog/mmc/FM141/SC1169/SS1577/LN1789)
-pub fn setup_peripherals()  -> (
+pub fn setup_peripherals() -> (
     (
         impl OutputPin + ToggleableOutputPin,
         impl OutputPin + ToggleableOutputPin,
         impl OutputPin + ToggleableOutputPin,
     ),
     impl DelayMs<u8>,
-)
-{
+) {
     let mut dp = pac::Peripherals::take().unwrap();
-    let mut cp = cortex_m::Peripherals::take().unwrap();
-
+    let cp = cortex_m::Peripherals::take().unwrap();
 
     // enable system configuration controller clock
     dp.RCC.apb2enr.write(|w| w.syscfgen().enabled());
@@ -71,34 +79,26 @@ pub fn setup_peripherals()  -> (
     let delay_source = p_hal::delay::Delay::new(cp.SYST, clocks);
 
     let gpiob = dp.GPIOB.split();
+    let gpioc = dp.GPIOC.split();
 
     let user_led1 = gpiob.pb11.into_push_pull_output(); //red
     let user_led2 = gpiob.pb1.into_push_pull_output(); //green
     let user_led3 = gpiob.pb3.into_push_pull_output(); //blue
 
-    // setup a microsecond timer for timing PPM edges
-    // use cap/comp channel 3 on TIM3
-    //let mut fast_timer = Timer::tim3(dp.TIM3, 1.mhz(), clocks);
-    // You could use the 32-bit TIM2 counter,
-    // prescaled down to 1MHz so ticks were each 1us,
-    // you could use the maximal update interrupt to extend to 64-bit,
-    // but you'd have to create methods to read both 32-bit portions in an atomic fashion;
+    // turn on hardware inverter of RCIN
+    let mut rc_input_inv = gpioc.pc13.into_push_pull_output();
+    let _ = rc_input_inv.set_high();
 
-    //init CYCCNT cortex_m peripheral
-    DWT::unlock();
-    cp.DCB.enable_trace();
-    cp.DWT.enable_cycle_counter();
-    // let _dwt = cp.DWT.constrain(cp.DCB, clocks);
+    // setup a free-running microsecond timer for timing PPM edges
+    unsafe {
+        config_hrt(&mut dp.TIM2);
+    }
 
-    // PPM input:
-    // use TIM3 for HRT_TIMER
-    // use cap/comp channel 3 on TIM3 for PPM
-    // PPM in pin is gpiob.pb0  af2
-    //TODO verify: no need to switch to AF2 ? (using into_alternate_af2() )
+    // PPM-in pin is gpiob.pb0
     let mut ppm_in = gpiob.pb0.into_pull_up_input();
     ppm_in.make_interrupt_source(&mut dp.SYSCFG);
+    ppm_in.trigger_on_edge(&mut dp.EXTI, Edge::RISING);
     ppm_in.enable_interrupt(&mut dp.EXTI);
-    ppm_in.trigger_on_edge(&mut dp.EXTI, Edge::FALLING);
 
     cortex_m::interrupt::free(|cs| {
         PPM_INPUT_PIN.borrow(cs).replace(Some(ppm_in));
@@ -106,97 +106,111 @@ pub fn setup_peripherals()  -> (
 
     // Enable EXTI0 interrupt in NVIC
     pac::NVIC::unpend(pac::Interrupt::EXTI0);
-    unsafe { pac::NVIC::unmask(pac::Interrupt::EXTI0); };
+    unsafe {
+        pac::NVIC::unmask(pac::Interrupt::EXTI0);
+    };
 
-    (
-        (user_led1, user_led2, user_led3),
-        delay_source,
-    )
+    ((user_led1, user_led2, user_led3), delay_source)
+}
+
+/// Configure a free-running microsecond timer
+/// for measuring when we receive PPM pulse edges
+unsafe fn config_hrt(tim: &mut pac::TIM2) {
+    // attach the timer to the clock
+    let rcc = &(*pac::RCC::ptr());
+    rcc.apb1enr.modify(|_, w| w.tim2en().set_bit());
+    rcc.apb1rstr.modify(|_, w| w.tim2rst().set_bit());
+    rcc.apb1rstr.modify(|_, w| w.tim2rst().clear_bit());
+
+    // disable the timer
+    tim.cr1.modify(|_, w| w.cen().clear_bit());
+    // reset counter
+    tim.cnt.reset();
+
+    // allow for up to this many ticks
+    tim.arr.write(|w| w.bits(MAX_PPM_TICK as u32));
+
+    // configure prescaler for 1 microsecond ticks (1 MHz)
+    // APB1 is 42 MHz with ppre factor of 2 -> 84 MHz TIM_CLOCK
+    let psc: u16 = 84 - 1; // prescaler should be desired N - 1
+    tim.psc.write(|w| w.psc().bits(psc));
+
+    // start timer free running
+    tim.cr1.modify(|_, w| w.cen().set_bit());
 }
 
 /// This interrupt handler should be called whenever
-/// the PPM input pin detects a (rising) edge.
+/// the PPM input pin detects a pulse edge
 #[interrupt]
 fn EXTI0() {
-    let microtime =
-        cortex_m::interrupt::free(|cs| {
-            // clear the interrupt
-            if let Some(ref mut pin) =  PPM_INPUT_PIN.borrow(cs).borrow_mut().deref_mut() {
-                pin.clear_interrupt_pending_bit();
-            }
+    cortex_m::interrupt::free(|cs| {
+        // clear the interrupt
+        if let Some(ref mut pin) = PPM_INPUT_PIN.borrow(cs).borrow_mut().deref_mut() {
+            pin.clear_interrupt_pending_bit();
+        }
+    });
 
-            // get current time
-            // let cur_cycles = DWT::get_cycle_count();
-            // rprintln!("cycles: {}", cur_cycles);
-            // let micros = cur_cycles/CYCLES_PER_MICRO;
+    //NOTE(unsafe) atomic read with no side effects
+    let raw_tick = unsafe { (*pac::TIM2::ptr()).cnt.read().bits() as HighResTick };
 
-            // // TODO get clock time in a safer way? this is atomic with no side effects
-            let cur_sys_ticks = cortex_m::peripheral::SYST::get_current();
-            let monotonic_ticks = u32::max_value() - cur_sys_ticks;
-            let ticks_per_10ms = cortex_m::peripheral::SYST::get_ticks_per_10ms();
-            let micros = (monotonic_ticks / ticks_per_10ms) * 10000;
+    // tell the decoder about the new pulse detected
+    cortex_m::interrupt::free(|cs| {
+        if let Some(ref mut decoder) = PPM_DECODER.borrow(cs).borrow_mut().deref_mut() {
+            decoder.handle_pulse_start(raw_tick);
+        };
+    });
 
-            rprintln!("ticks: {} micros: {}", monotonic_ticks, micros);
-
-            // tell the PPM decoder we got a pulse start
-            if let Some(ref mut decoder) = PPM_DECODER.borrow(cs).borrow_mut().deref_mut() {
-                decoder.handle_pulse_start(micros);
-            }
-            micros
-        });
-
-    //rprintln!("micros: {}", microtime);
+    // this is just for debugging purposes: print the gap between detected edges
+    let last_tick = LAST_RAW_TICK.load(Ordering::Relaxed) as HighResTick;
+    let wrap_delta = if raw_tick > last_tick {
+        raw_tick - last_tick
+    } else {
+        (MAX_PPM_TICK - last_tick) + raw_tick
+    };
+    LAST_RAW_TICK.store(raw_tick as usize, Ordering::Relaxed);
+    rprintln!("{}", wrap_delta);
 }
-
-
 
 #[entry]
 fn main() -> ! {
     rtt_init_print!(NoBlockTrim);
     rprintln!("-- > MAIN --");
 
-    //create and stash the ppm decoder
-    let parser = ppm_decode::PpmParser::new();
     cortex_m::interrupt::free(|cs| {
+        let mut parser = ppm_decode::PpmParser::new();
+        parser
+            .set_minimum_channels(8)
+            .set_sync_width(14000)
+            .set_max_ppm_time(MAX_PPM_TICK);
         PPM_DECODER.borrow(cs).replace(Some(parser))
     });
 
-    let (
-        (mut user_led1,
-            mut user_led2,
-            mut user_led3),
-        mut delay_source,
-    ) = setup_peripherals();
+    let ((mut user_led1, mut user_led2, mut user_led3), _delay_source) = setup_peripherals();
 
     let _ = user_led1.set_low();
     let _ = user_led2.set_high();
     let _ = user_led3.set_high();
 
-
     loop {
-        // all the interesting stuff happens in interrupt handlers
         let _ = user_led1.toggle();
 
-        if let Some(frame) =
-            cortex_m::interrupt::free(|cs| {
-                if let Some(ref mut parser) =
-                PPM_DECODER.borrow(cs).borrow_mut().deref_mut() {
-                    parser.next_frame()
-                } else {
-                    None
-                }
-            })
-        {
-            // valid PPM frame parsed
+        if let Some(frame) = cortex_m::interrupt::free(|cs| {
+            if let Some(ref mut decoder) = PPM_DECODER.borrow(cs).borrow_mut().deref_mut() {
+                decoder.next_frame()
+            } else {
+                None
+            }
+        }) {
+            // we received a complete frame
             let _ = user_led2.set_low();
-            // let subset = frame.chan_values[..frame.chan_count]
-            rprintln!("chans {}: {:?}", frame.chan_count, &frame.chan_values[..frame.chan_count as usize]);
-        }
-        else {
+            rprintln!(
+                "chans {}: {:?}",
+                frame.chan_count,
+                &frame.chan_values[..frame.chan_count as usize]
+            );
+        } else {
             // no available PPM frame
             let _ = user_led2.set_high();
-            delay_source.delay_ms(10u8);
-
         }
     }
 }

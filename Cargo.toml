@@ -3,13 +3,10 @@ name = "test_ppm_decode"
 version = "0.1.0"
 authors = ["Todd Stellanova <tstellanova@users.noreply.github.com>"]
 edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Example of using the ppm_decode crate on a real microcontroller"
 
 [dependencies]
-#ppm_decode = { path="../ppm_decode"}
-#ppm_decode = {git= "https://github.com/tstellanova/ppm_decode" }
-ppm_decode = "0.1.2"
+ppm_decode = "0.1.3"
 embedded-hal = "0.2.3"
 cortex-m = "0.6.2"
 cortex-m-rt = "0.6.12"
