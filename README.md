@@ -24,7 +24,7 @@ with microsecond resolution and hand those to the ppm_decoder.
 - [x] Configure free-running microsecond timer
 - [x] Configure RCIN input pin capture
 - [x] Enable the Pixracer's hardware inverter for the RCIN signal (FrSky CPPM is inverted)
-- [ ] Capture PPM pulse edges consistently in an interrupt handler
-- [ ] Provide PPM edge timing to `ppm_decode`
-- [ ] Read frames from ppm decoder 
+- [x] Capture PPM pulse edges consistently in an interrupt handler
+- [x] Provide PPM edge timing to `ppm_decode`
+- [x] Read frames from ppm decoder 
 
