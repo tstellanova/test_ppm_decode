@@ -36,14 +36,15 @@ use ppm_decode::PpmParser;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-type HighResTick = u32;
+/// The resolution of the timer used to mark the arrival of PPM pulses
+type PpmTimerTick = u16;
 /// enough ticks to account for at least one full PPM frame
-const MAX_PPM_TICK: HighResTick = 0xFFFF;
+const MAX_PPM_TICK: PpmTimerTick = 0xFFFF;
 
-/// The GPIO input pin we use to read the CPPM input signal
+/// Type of the GPIO input pin we use to read the CPPM input signal
 type PpmInputPin = p_hal::gpio::gpiob::PB0<p_hal::gpio::Input<p_hal::gpio::PullUp>>;
 
-/// Stores the shared input pin touched by interrupt handler
+/// Stores the shared PPM input pin
 static PPM_INPUT_PIN: Mutex<RefCell<Option<PpmInputPin>>> = Mutex::new(RefCell::new(None));
 
 /// Stores the PPM decoder touched by interrupt handler and main loop
@@ -52,14 +53,18 @@ static PPM_DECODER: Mutex<RefCell<Option<PpmParser>>> = Mutex::new(RefCell::new(
 /// For debugging/tracing output: stores the timer tick of the most recent PPM pulse edge
 static LAST_RAW_TICK: AtomicUsize = AtomicUsize::new(0);
 
-/// Initialize peripherals for Pixracer board. Pixracer chip is:
+/// Initialize peripherals for Pixracer board.
+/// The Pixracer chip is:
 /// [STM32F427VIT6 rev.3](http://www.st.com/web/en/catalog/mmc/FM141/SC1169/SS1577/LN1789)
+///
 pub fn setup_peripherals() -> (
+    // LED output pins
     (
         impl OutputPin + ToggleableOutputPin,
         impl OutputPin + ToggleableOutputPin,
         impl OutputPin + ToggleableOutputPin,
     ),
+    // A delay source
     impl DelayMs<u8>,
 ) {
     let mut dp = pac::Peripherals::take().unwrap();
@@ -68,6 +73,7 @@ pub fn setup_peripherals() -> (
     // enable system configuration controller clock
     dp.RCC.apb2enr.write(|w| w.syscfgen().enabled());
     let rcc = dp.RCC.constrain();
+    // configure clocks according to what we know the Pixracer board operates at:
     let clocks = rcc
         .cfgr
         .use_hse(24.mhz()) // 24 MHz xtal
@@ -85,18 +91,19 @@ pub fn setup_peripherals() -> (
     let user_led2 = gpiob.pb1.into_push_pull_output(); //green
     let user_led3 = gpiob.pb3.into_push_pull_output(); //blue
 
-    // turn on hardware inverter of RCIN
+    // turn on hardware inverter of RCIN on Pixracer
     let mut rc_input_inv = gpioc.pc13.into_push_pull_output();
-    let _ = rc_input_inv.set_high();
+    rc_input_inv.set_high().expect("couldn't enable PPM signal inverter");
 
     // setup a free-running microsecond timer for timing PPM edges
     unsafe {
-        config_hrt(&mut dp.TIM2);
+        config_hrt(&mut dp.TIM3);
     }
 
-    // PPM-in pin is gpiob.pb0
+    // PPM-in pin is PB0
     let mut ppm_in = gpiob.pb0.into_pull_up_input();
     ppm_in.make_interrupt_source(&mut dp.SYSCFG);
+    // Although the FrSky CPPM is inverted, we enabled a hw inverter above
     ppm_in.trigger_on_edge(&mut dp.EXTI, Edge::RISING);
     ppm_in.enable_interrupt(&mut dp.EXTI);
 
@@ -114,33 +121,33 @@ pub fn setup_peripherals() -> (
 }
 
 /// Configure a free-running microsecond timer
-/// for measuring when we receive PPM pulse edges
-unsafe fn config_hrt(tim: &mut pac::TIM2) {
+/// for marking when we receive PPM pulse edges
+unsafe fn config_hrt(tim: &mut pac::TIM3) {
     // attach the timer to the clock
     let rcc = &(*pac::RCC::ptr());
-    rcc.apb1enr.modify(|_, w| w.tim2en().set_bit());
-    rcc.apb1rstr.modify(|_, w| w.tim2rst().set_bit());
-    rcc.apb1rstr.modify(|_, w| w.tim2rst().clear_bit());
+    rcc.apb1enr.modify(|_, w| w.tim3en().set_bit());
+    rcc.apb1rstr.modify(|_, w| w.tim3rst().set_bit());
+    rcc.apb1rstr.modify(|_, w| w.tim3rst().clear_bit());
 
     // disable the timer
     tim.cr1.modify(|_, w| w.cen().clear_bit());
     // reset counter
     tim.cnt.reset();
 
-    // allow for up to this many ticks
+    // allow for up to this many ticks to be counted
     tim.arr.write(|w| w.bits(MAX_PPM_TICK as u32));
 
     // configure prescaler for 1 microsecond ticks (1 MHz)
     // APB1 is 42 MHz with ppre factor of 2 -> 84 MHz TIM_CLOCK
-    let psc: u16 = 84 - 1; // prescaler should be desired N - 1
-    tim.psc.write(|w| w.psc().bits(psc));
+    const PSC: u16 = 84 - 1; // prescaler should be desired N - 1
+    tim.psc.write(|w| w.psc().bits(PSC));
 
     // start timer free running
     tim.cr1.modify(|_, w| w.cen().set_bit());
 }
 
-/// This interrupt handler should be called whenever
-/// the PPM input pin detects a pulse edge
+/// This interrupt handler should be called whenever the microcontroller detects
+/// a PPM pulse edge on the RCIN input pin.
 #[interrupt]
 fn EXTI0() {
     cortex_m::interrupt::free(|cs| {
@@ -150,18 +157,19 @@ fn EXTI0() {
         }
     });
 
-    //NOTE(unsafe) atomic read with no side effects
-    let raw_tick = unsafe { (*pac::TIM2::ptr()).cnt.read().bits() as HighResTick };
+    // get the timer count at the moment of the pulse edge
+    // NOTE(unsafe) atomic read with no side effects
+    let raw_tick = unsafe { (*pac::TIM3::ptr()).cnt.read().bits() as PpmTimerTick };
 
     // tell the decoder about the new pulse detected
     cortex_m::interrupt::free(|cs| {
         if let Some(ref mut decoder) = PPM_DECODER.borrow(cs).borrow_mut().deref_mut() {
-            decoder.handle_pulse_start(raw_tick);
+            decoder.handle_pulse_start(raw_tick as ppm_decode::PpmTime);
         };
     });
 
-    // this is just for debugging purposes: print the gap between detected edges
-    let last_tick = LAST_RAW_TICK.load(Ordering::Relaxed) as HighResTick;
+    // the following is for debugging purposes: print the gap between detected edges
+    let last_tick = LAST_RAW_TICK.load(Ordering::Relaxed) as PpmTimerTick;
     let wrap_delta = if raw_tick > last_tick {
         raw_tick - last_tick
     } else {
@@ -181,7 +189,7 @@ fn main() -> ! {
         parser
             .set_minimum_channels(8)
             .set_sync_width(14000)
-            .set_max_ppm_time(MAX_PPM_TICK);
+            .set_max_ppm_time(MAX_PPM_TICK  as ppm_decode::PpmTime);
         PPM_DECODER.borrow(cs).replace(Some(parser))
     });
 
@@ -200,7 +208,8 @@ fn main() -> ! {
             } else {
                 None
             }
-        }) {
+        })
+        {
             // we received a complete frame
             let _ = user_led2.set_low();
             rprintln!(
@@ -208,7 +217,8 @@ fn main() -> ! {
                 frame.chan_count,
                 &frame.chan_values[..frame.chan_count as usize]
             );
-        } else {
+        }
+        else {
             // no available PPM frame
             let _ = user_led2.set_high();
         }
